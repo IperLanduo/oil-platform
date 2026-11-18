@@ -34,8 +34,8 @@ WATCH_METRICS = {
     "stress": "壓力指數",
 }
 
-st.set_page_config(page_title="精油生理數據平台", layout="wide")
-st.title("精油生理數據整合平台（第一版）")
+st.set_page_config(page_title="香當有感 ScentiQ", layout="wide")
+st.title("香當有感 ScentiQ")
 st.caption("整合 ASUS Watch 血壓資料與腦電波資料，比較使用精油前後的變化。")
 
 
@@ -87,12 +87,17 @@ with st.sidebar:
     eeg_file = st.file_uploader("腦電波整理 Excel (.xlsx)", type="xlsx")
     st.caption("沒有上傳的話，會先用範例資料示範。")
 
-    st.header("2. 清理設定")
-    drop_invalid = st.checkbox("移除「壓力指數空白 / RMSSD=0」的量測", value=True,
-                               help="這些通常是量測失敗。取消勾選可以看看保留它們會怎樣。")
-    gap = st.number_input("手動量測間隔超過幾分鐘，算新的一場實驗", 10, 240, 30, step=5)
-    n_pre = st.number_input("每場實驗的前幾筆是「擦精油前」", 1, 5, 1,
-                            help="預設第 1 筆是擦精油前的基準值，後面都是擦精油後。")
+    st.header("2. 顯示更多")
+    show_advanced = st.toggle("顯示進階分析（後台）", value=False,
+                              help="平常只看總結就好。要檢查細節、看每場實驗或做統計時再打開。")
+
+    # 清理設定收在折疊區塊裡：大部分時候用預設值就好，不用動。
+    with st.expander("清理設定（通常不用改）"):
+        drop_invalid = st.checkbox("移除「壓力指數空白 / RMSSD=0」的量測", value=True,
+                                   help="這些通常是量測失敗。取消勾選可以看看保留它們會怎樣。")
+        gap = st.number_input("手動量測間隔超過幾分鐘，算新的一場實驗", 10, 240, 30, step=5)
+        n_pre = st.number_input("每場實驗的前幾筆是「擦精油前」", 1, 5, 1,
+                                help="預設第 1 筆是擦精油前的基準值，後面都是擦精油後。")
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +118,72 @@ try:
 except ValueError as e:
     eeg = pd.DataFrame()
     st.error(f"腦電波檔案讀不懂：{e}")
+
+# ---------------------------------------------------------------------------
+# 總結頁（前台）：一眼看出「擦精油前 vs 擦精油後」變化多少
+# ---------------------------------------------------------------------------
+# 想法：評審或一般使用者不需要看五個分頁，只想知道「有沒有變、變多少」。
+# 所以這裡只挑 4 個最好懂的指標，每個指標一張卡片：擦前平均 → 擦後平均。
+# 完整的圖和統計表都還在下面的「進階分析」，沒有刪掉。
+
+def before_after_watch(metric: str):
+    """手錶：每場實驗先算「擦前平均」和「擦後平均」，再把所有場次放在一起比。"""
+    if sessions.empty:
+        return None
+    s = sessions.assign(階段=sessions["order"].apply(lambda k: "擦前" if k < n_pre else "擦後"))
+    per = s.pivot_table(index="session", columns="階段", values=metric)
+    if "擦前" not in per or "擦後" not in per:
+        return None
+    return paired_compare(per["擦前"], per["擦後"])
+
+
+def before_after_eeg(metric: str):
+    """腦波：每天的 pre 跟「擦後所有時間點的平均」比。"""
+    if eeg.empty or metric not in eeg:
+        return None
+    wide = eeg.pivot_table(index="date", columns="stage", values=metric, observed=True)
+    if "pre" not in wide:
+        return None
+    after = wide.drop(columns="pre").mean(axis=1)
+    return paired_compare(wide["pre"], after)
+
+
+def summary_card(col, title, unit, r, good_when_down, meaning):
+    """畫一張卡片。good_when_down=True 代表數字變低是「比較放鬆」的方向。"""
+    with col.container(border=True):
+        st.markdown(f"**{title}**")
+        if r is None or r["組數 n"] == 0:
+            st.write("還沒有資料")
+            return
+        change = r["平均變化(後-前)"]
+        # delta_color="inverse"：數字變低時顯示綠色（血壓變低是好事）
+        st.metric("擦精油後", f"{r['後 平均']:.1f} {unit}", f"{change:+.1f} {unit}",
+                  delta_color="inverse" if good_when_down else "normal")
+        st.caption(f"擦精油前：{r['前 平均']:.1f} {unit}　｜　{meaning}")
+        p = r["t 檢定 p 值"]
+        if p is None or pd.isna(p):
+            st.caption(f"共 {r['組數 n']} 組，資料太少，還不能判斷")
+        elif p < 0.05:
+            st.caption(f"共 {r['組數 n']} 組，✅ 這個變化不太像只是巧合")
+        else:
+            st.caption(f"共 {r['組數 n']} 組，⚪ 目前還看不出確定的差異")
+
+
+st.header("結論：擦精油前後，身體有什麼變化？")
+cards = st.columns(4)
+summary_card(cards[0], "收縮壓（血壓）", "mmHg", before_after_watch("sys"), True, "變低 = 血壓下降")
+summary_card(cards[1], "心跳", "次/分", before_after_watch("hr"), True, "變低 = 心跳變慢")
+summary_card(cards[2], "HRV 心率變異度（RMSSD）", "ms", before_after_watch("rmssd"), False, "變高 = 通常較放鬆")
+summary_card(cards[3], "腦波放鬆度（Meditation）", "分", before_after_eeg("Meditation"), False, "變高 = 較放鬆")
+st.caption("綠色箭頭 = 往「放鬆」的方向變。手錶數據以每場手動量測實驗為一組，腦波以每天為一組。"
+           "本平台只整理與呈現數據，不用來判斷療效或診斷疾病。")
+
+if not show_advanced:
+    st.info("想看每場實驗的圖表和完整統計？在左邊打開「顯示進階分析（後台）」。")
+    st.stop()   # 停在這裡，下面的進階分頁就不會顯示
+
+st.divider()
+st.header("進階分析（後台）")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["① 資料總覽與清理", "② 手錶：每場擦前 vs 擦後", "③ 手錶：時段比較（如睡眠）", "④ 腦電波：擦前 vs 擦後", "⑤ 同一天合併比對"]
